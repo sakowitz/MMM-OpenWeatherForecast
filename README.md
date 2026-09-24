@@ -29,6 +29,12 @@ npm ci
 
 ## Configuration
 
+When several browsers display the same MagicMirror server, the node helper shares
+one in-memory weather cache across them. The first request after
+`updateInterval` expires refreshes OpenWeather; simultaneous requests join that
+same refresh, and newly opened displays receive the current cached snapshot.
+The cache is cleared whenever the MagicMirror server restarts.
+
 At a minimum you need to supply the following required configuration parameters:
 
 * `apikey`

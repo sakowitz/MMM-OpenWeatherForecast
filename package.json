@@ -11,7 +11,8 @@
   "scripts": {
     "lint": "eslint",
     "lint:fix": "eslint --fix",
-    "test": "node --run lint"
+    "test": "node --run test:unit",
+    "test:unit": "node --test --import ./tests/setup.js tests/node_helper-cache.test.js"
   },
   "author": "Jeff Clarke",
   "license": "MIT",

@@ -29,6 +29,8 @@ module.exports = NodeHelper.create({
 
   start () {
     Log.log(`Starting node_helper for: ${this.name}`);
+    this.weatherCache = new Map();
+    this.inFlightWeather = new Map();
   },
 
   evalHaTemplateString(template, config) {
@@ -37,82 +39,140 @@ module.exports = NodeHelper.create({
 
   async socketNotificationReceived (notification, payload) {
     if (notification === "OPENWEATHER_FORECAST_GET") {
-      if (payload.apikey === null || payload.apikey === "") {
-        Log.error(`[MMM-OpenWeatherForecast] ${moment().format("D-MMM-YY HH:mm")} ** ERROR ** No API key configured. Get an API key at https://openweathermap.org/`);
-      } else if (payload.latitude === null || payload.latitude === "" || payload.longitude === null || payload.longitude === "") {
-        Log.error(`[MMM-OpenWeatherForecast] ${moment().format("D-MMM-YY HH:mm")} ** ERROR ** Latitude and/or longitude not provided.`);
-      } else {
-        // make request to OpenWeather One Call API
-        const url = `${payload.apiBaseURL
-        }lat=${payload.latitude
-        }&lon=${payload.longitude
-        }&exclude=minutely` +
-        `&appid=${payload.apikey
-        }&units=${payload.units
-        }&lang=${payload.language}`;
-
-        if (typeof this.config !== "undefined") {
-          Log.debug(`[MMM-OpenWeatherForecast] Fetching url: ${url}`);
-        }
-
-        try {
-          const response = await fetch(url);
-
-          if (response.status !== 200) {
-            Log.error(`[MMM-OpenWeatherForecast] API response error: ${response.status} ${response.statusText}`);
-            return;
-          }
-
-          const data = await response.json();
-
-          if (typeof data !== "undefined") {
-            data.instanceId = payload.instanceId;
-// --- START: Home Assistant Temperature integration ---
-            // Check config.js
-            if (payload.haUrl != null) {
-              try {
-                
-                const haFetchUrl = this.evalHaTemplateString(payload.haUrlTemplate, payload);
-                Log.debug(`[MMM-OpenWeatherForecast] Fetching HA Url: ${haFetchUrl}`);
-                
-                // Request data from Home Assistant
-                const haResponse = await fetch(haFetchUrl, {
-                  method: 'GET',
-                  headers: {
-                    'Authorization': `Bearer ${payload.haToken}`,
-                    'Content-Type': 'application/json'
-                  }
-                });
-
-                if (haResponse.ok) {
-                  const haData = await haResponse.json();
-                  Log.info(`[MMM-OpenWeatherForecast] Using ha data: ${haData}`);
-                  
-                  // Overwrite Openweather Temo
-                  if (haData && haData.state) {
-                    const haTemp = parseFloat(haData.state);
-                    if (!isNaN(haTemp) && data.current) {
-                      Log.debug(`[MMM-OpenWeatherForecast] Using HA temperature ${haTemp}`);
-                      data.current.temp = haTemp; 
-                    }
-                  }
-                } else {
-                  Log.warn(`[MMM-OpenWeatherForecast] Home Assistant API Fehler: ${haResponse.status}`);
-                }
-              } catch (haError) {
-                // Log HA unavailability                
-                Log.error(`[MMM-OpenWeatherForecast] Error connecting to HA: ${haError}`);
-              }
-            }
-// --- END: Home Assistant Temperature Integration ---
-            this.sendSocketNotification("OPENWEATHER_FORECAST_DATA", data);
-          }
-        } catch (error) {
-          Log.error(`[MMM-OpenWeatherForecast] ${moment().format("D-MMM-YY HH:mm")} ** ERROR ** ${error}\n${error.stack}`);
-        }
-      }
+      await this.handleWeatherRequest(payload);
     } else if (notification === "CONFIG") {
       this.config = payload;
     }
+  },
+
+  async handleWeatherRequest(payload) {
+    if (!this.isValidRequest(payload)) return;
+
+    const key = this.weatherCacheKey(payload);
+    const cached = this.weatherCache.get(key);
+    const ttl = this.weatherCacheTtl(payload);
+
+    if (cached && Date.now() - cached.fetchedAt < ttl) {
+      this.sendWeatherData(cached.data, payload.instanceId, "hit");
+      return;
+    }
+
+    const pending = this.inFlightWeather.get(key);
+    if (pending) {
+      pending.instanceIds.add(payload.instanceId);
+      await pending.promise;
+      return;
+    }
+
+    const request = {
+      instanceIds: new Set([payload.instanceId]),
+      promise: null
+    };
+    request.promise = this.fetchAndBroadcastWeather(key, payload, request, cached);
+    this.inFlightWeather.set(key, request);
+    await request.promise;
+  },
+
+  isValidRequest(payload) {
+    if (payload.apikey === null || payload.apikey === "") {
+      Log.error(`[MMM-OpenWeatherForecast] ${moment().format("D-MMM-YY HH:mm")} ** ERROR ** No API key configured. Get an API key at https://openweathermap.org/`);
+      return false;
+    }
+    if (payload.latitude === null || payload.latitude === "" || payload.longitude === null || payload.longitude === "") {
+      Log.error(`[MMM-OpenWeatherForecast] ${moment().format("D-MMM-YY HH:mm")} ** ERROR ** Latitude and/or longitude not provided.`);
+      return false;
+    }
+    return true;
+  },
+
+  weatherCacheKey(payload) {
+    return JSON.stringify({
+      apiBaseURL: payload.apiBaseURL,
+      latitude: payload.latitude,
+      longitude: payload.longitude,
+      units: payload.units,
+      language: payload.language,
+      haUrl: payload.haUrl,
+      haSensor: payload.haSensor
+    });
+  },
+
+  weatherCacheTtl(payload) {
+    const configuredMinutes = Number(payload.updateInterval ?? this.config?.updateInterval);
+    const minutes = Number.isFinite(configuredMinutes) ? configuredMinutes : 10;
+    return Math.max(1, minutes) * 60 * 1000;
+  },
+
+  async fetchAndBroadcastWeather(key, payload, request, cached) {
+    try {
+      const data = await this.fetchWeather(payload);
+      this.weatherCache.set(key, {data, fetchedAt: Date.now()});
+      for (const instanceId of request.instanceIds) {
+        this.sendWeatherData(data, instanceId, "fresh");
+      }
+      Log.info(`[MMM-OpenWeatherForecast] Shared cache refreshed for ${request.instanceIds.size} client instance(s).`);
+    } catch (error) {
+      Log.error(`[MMM-OpenWeatherForecast] ${moment().format("D-MMM-YY HH:mm")} ** ERROR ** ${error}\n${error.stack}`);
+      if (cached) {
+        for (const instanceId of request.instanceIds) {
+          this.sendWeatherData(cached.data, instanceId, "stale");
+        }
+      }
+    } finally {
+      this.inFlightWeather.delete(key);
+    }
+  },
+
+  async fetchWeather(payload) {
+    const url = `${payload.apiBaseURL
+    }lat=${payload.latitude
+    }&lon=${payload.longitude
+    }&exclude=minutely` +
+    `&appid=${payload.apikey
+    }&units=${payload.units
+    }&lang=${payload.language}`;
+    Log.debug("[MMM-OpenWeatherForecast] Refreshing shared OpenWeather cache.");
+
+    const response = await fetch(url);
+    if (response.status !== 200) {
+      throw new Error(`API response error: ${response.status} ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    await this.applyHomeAssistantTemperature(data, payload);
+    return data;
+  },
+
+  async applyHomeAssistantTemperature(data, payload) {
+    if (payload.haUrl == null) return;
+
+    try {
+      const haFetchUrl = this.evalHaTemplateString(payload.haUrlTemplate, payload);
+      const haResponse = await fetch(haFetchUrl, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${payload.haToken}`,
+          "Content-Type": "application/json"
+        }
+      });
+      if (!haResponse.ok) {
+        Log.warn(`[MMM-OpenWeatherForecast] Home Assistant API error: ${haResponse.status}`);
+        return;
+      }
+
+      const haData = await haResponse.json();
+      const haTemp = Number.parseFloat(haData?.state);
+      if (Number.isFinite(haTemp) && data.current) data.current.temp = haTemp;
+    } catch (error) {
+      Log.error(`[MMM-OpenWeatherForecast] Error connecting to HA: ${error}`);
+    }
+  },
+
+  sendWeatherData(data, instanceId, cacheStatus) {
+    this.sendSocketNotification("OPENWEATHER_FORECAST_DATA", {
+      ...data,
+      instanceId,
+      cacheStatus
+    });
   }
 });
