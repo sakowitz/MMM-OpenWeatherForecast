@@ -92,8 +92,8 @@ module.exports = NodeHelper.create({
       longitude: payload.longitude,
       units: payload.units,
       language: payload.language,
-      haUrl: payload.haUrl,
-      haSensor: payload.haSensor
+      haUrl: payload.haUrl || null,
+      haSensor: payload.haSensor || null
     });
   },
 

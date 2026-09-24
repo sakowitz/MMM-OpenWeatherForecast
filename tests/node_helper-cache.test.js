@@ -58,6 +58,24 @@ describe("shared weather cache", () => {
     assert.equal(notifications[1].payload.cacheStatus, "hit");
   });
 
+  it("shares a cache key with clients that omit optional Home Assistant fields", async () => {
+    let fetchCount = 0;
+    global.fetch = async () => {
+      fetchCount += 1;
+      return response({current: {temp: 72}});
+    };
+
+    const legacyPayload = weatherPayload("weather-legacy");
+    delete legacyPayload.haUrl;
+    delete legacyPayload.haSensor;
+
+    await helper.socketNotificationReceived("OPENWEATHER_FORECAST_GET", legacyPayload);
+    await helper.socketNotificationReceived("OPENWEATHER_FORECAST_GET", weatherPayload("weather-current"));
+
+    assert.equal(fetchCount, 1);
+    assert.equal(notifications[1].payload.cacheStatus, "hit");
+  });
+
   it("coalesces concurrent requests and broadcasts once per instance", async () => {
     let fetchCount = 0;
     let resolveFetch;
